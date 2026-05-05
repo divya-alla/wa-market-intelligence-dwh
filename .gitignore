@@ -1,0 +1,6 @@
+*.db
+*.parquet
+.venv/
+__pycache__/
+.streamlit/
+.claude/
