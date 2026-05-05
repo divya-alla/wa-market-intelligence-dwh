@@ -1,165 +1,171 @@
 """
-ETL pipeline: pulls WA business licensing and census data,
-transforms into the star schema, and loads into DuckDB.
-
-Data sources:
-  - WA Dept of Revenue business licensing (Socrata open data)
-  - US Census ACS 5-year estimates (via Census API)
+ETL Pipeline: WA State Business License Data
+Extracts from Socrata API, classifies semantically, saves as Parquet staging layer.
 """
 
-import hashlib
+import re
+import logging
 import requests
 import pandas as pd
-import duckdb
-from datetime import date
+from typing import Optional, Tuple
 
-from warehouse_setup import get_connection, DB_PATH
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-# WA open data — active business licenses (Socrata)
-WA_BUSINESS_URL = (
-    "https://data.wa.gov/resource/bhd9-y5zh.json"
-    "?$limit=50000&$where=business_state_of_formation='WA'"
-)
+API_URL      = "https://data.wa.gov/resource/4wur-kfnr.json"
+RECORD_LIMIT = 15_000
+OUTPUT_PATH  = "stg_wa_businesses.parquet"
 
-# NAICS top-level sectors for dimension seeding
-NAICS_SECTORS = [
-    ("44", "Retail Trade", "Retail"),
-    ("72", "Accommodation and Food Services", "Hospitality"),
-    ("62", "Health Care and Social Assistance", "Healthcare"),
-    ("54", "Professional, Scientific, and Technical Services", "Professional"),
-    ("81", "Other Services (except Public Administration)", "Services"),
-    ("23", "Construction", "Construction"),
-    ("31", "Manufacturing", "Manufacturing"),
-    ("52", "Finance and Insurance", "Finance"),
+TARGET_CITIES = [
+    "BOTHELL", "LYNNWOOD", "EVERETT", "WOODINVILLE", "REDMOND",
+    "KIRKLAND", "SEATTLE", "SPOKANE", "TACOMA", "VANCOUVER",
+]
+
+# Priority-ordered rules: first match wins.
+# 611610 appears in both Kids and Art specs — Kids takes priority here.
+NAICS_RULES = [
+    ("exact",  "611620", "Kids Activities & Education"),
+    ("exact",  "611610", "Kids Activities & Education"),
+    ("exact",  "624410", "Kids Activities & Education"),
+    ("exact",  "711510", "Art Workshops & Creative"),
+    ("exact",  "541430", "Art Workshops & Creative"),
+    ("exact",  "711130", "Art Workshops & Creative"),
+    ("exact",  "561920", "Event & Party Businesses"),
+    ("exact",  "532284", "Event & Party Businesses"),
+    ("exact",  "711310", "Event & Party Businesses"),
+    ("exact",  "532289", "Event & Party Businesses"),
+    ("exact",  "561720", "Professional Cleaning Services"),
+    ("exact",  "561740", "Professional Cleaning Services"),
+    ("exact",  "713940", "Health, Wellness & Fitness"),
+    ("exact",  "812112", "Health, Wellness & Fitness"),
+    ("exact",  "812199", "Health, Wellness & Fitness"),
+    ("prefix", "722",    "Restaurants & Food Services"),
+    ("prefix", "44",     "Retail & Boutiques"),
+    ("prefix", "45",     "Retail & Boutiques"),
 ]
 
 
-def _hash_key(*parts) -> int:
-    raw = "|".join(str(p) for p in parts)
-    return int(hashlib.md5(raw.encode()).hexdigest()[:8], 16)
+def classify_naics(code: str) -> str:
+    code = str(code).strip() if code else ""
+    for match_type, value, category in NAICS_RULES:
+        if match_type == "exact"   and code == value:       return category
+        if match_type == "prefix"  and code.startswith(value): return category
+    return "Other Local Services"
 
 
-# ---------- Extract ----------
-
-def extract_businesses() -> pd.DataFrame:
-    print("Extracting WA business license data...")
-    resp = requests.get(WA_BUSINESS_URL, timeout=60)
-    resp.raise_for_status()
-    df = pd.DataFrame(resp.json())
-    print(f"  {len(df):,} records retrieved")
-    return df
-
-
-# ---------- Transform ----------
-
-def transform_geography(df: pd.DataFrame) -> pd.DataFrame:
-    geo_cols = ["business_zip", "city", "county"]
-    available = [c for c in geo_cols if c in df.columns]
-    geo = (
-        df[available]
-        .drop_duplicates()
-        .rename(columns={"business_zip": "zip_code"})
-    )
-    geo["state"] = "WA"
-    geo["latitude"] = None
-    geo["longitude"] = None
-    geo["geo_key"] = geo.apply(
-        lambda r: _hash_key(r.get("zip_code", ""), r.get("city", "")), axis=1
-    )
-    return geo
+def extract_lat_lon(location_val) -> Tuple[Optional[float], Optional[float]]:
+    """Handle both GeoJSON Point and Socrata human_address formats."""
+    if not isinstance(location_val, dict):
+        return None, None
+    try:
+        # GeoJSON Point: {"type": "Point", "coordinates": [lon, lat]}
+        if location_val.get("type") == "Point":
+            coords = location_val.get("coordinates", [])
+            if len(coords) >= 2:
+                return float(coords[1]), float(coords[0])
+        # Socrata flat format: {"latitude": "47.x", "longitude": "-122.x"}
+        lat = location_val.get("latitude") or location_val.get("lat")
+        lon = location_val.get("longitude") or location_val.get("lon")
+        return (float(lat) if lat else None, float(lon) if lon else None)
+    except (ValueError, TypeError):
+        return None, None
 
 
-def transform_businesses(df: pd.DataFrame) -> pd.DataFrame:
-    biz = df.copy()
-    biz["business_key"] = biz.index
-    rename = {
-        "ubi": "ubi",
-        "business_name": "business_name",
-        "entity_type_of_organization": "entity_type",
-        "business_status": "status",
-        "license_expiration_date": "open_date",
+def clean_zip(raw) -> Optional[str]:
+    if pd.isna(raw) or not raw:
+        return None
+    digits = re.sub(r"\D", "", str(raw))[:5]
+    return digits if len(digits) == 5 else None
+
+
+def _find_col(columns, *keywords, exclude=()) -> Optional[str]:
+    """Return first column whose name contains any keyword (and none of exclude)."""
+    for col in columns:
+        if any(k in col for k in keywords) and not any(e in col for e in exclude):
+            return col
+    return None
+
+
+def fetch_businesses() -> pd.DataFrame:
+    city_list = ", ".join(f"'{c}'" for c in TARGET_CITIES)
+    params = {
+        "$limit":  RECORD_LIMIT,
+        "$where":  f"upper(city) IN ({city_list})",
+        "$order":  "opendate DESC",
     }
-    keep = {k: v for k, v in rename.items() if k in biz.columns}
-    biz = biz.rename(columns=keep)[list(keep.values())].copy()
-    biz["business_key"] = range(len(biz))
-    return biz
+    log.info("Fetching up to %d records from %s...", RECORD_LIMIT, API_URL)
+    resp = requests.get(API_URL, params=params, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    log.info("Retrieved %d raw records", len(data))
+    return pd.DataFrame(data)
 
 
-# ---------- Load ----------
+def transform(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.lower().strip() for c in df.columns]
+    cols = df.columns.tolist()
 
-def load_dim_industry(con: duckdb.DuckDBPyConnection) -> None:
-    rows = [
-        (_hash_key(code), code, title, sector, sector)
-        for code, title, sector in NAICS_SECTORS
-    ]
-    con.executemany(
-        "INSERT OR IGNORE INTO dim_industry VALUES (?, ?, ?, ?, ?)", rows
-    )
-    print(f"  Loaded {len(rows)} industry dimension rows")
+    # ── Geospatial ──────────────────────────────────────────────────────────
+    if "location" in cols:
+        latlon         = df["location"].apply(extract_lat_lon)
+        df["latitude"]  = latlon.apply(lambda x: x[0])
+        df["longitude"] = latlon.apply(lambda x: x[1])
+    for coord in ("latitude", "longitude"):
+        if coord not in df.columns:
+            df[coord] = None
+        else:
+            df[coord] = pd.to_numeric(df[coord], errors="coerce")
 
+    # ── Identifiers ──────────────────────────────────────────────────────────
+    ubi_col  = _find_col(cols, "ubi")
+    df["ubi"] = df[ubi_col] if ubi_col else None
 
-def load_dim_geography(con: duckdb.DuckDBPyConnection, geo: pd.DataFrame) -> None:
-    con.register("_geo_staging", geo)
-    con.execute("""
-        INSERT OR IGNORE INTO dim_geography
-            (geo_key, zip_code, city, county, state, latitude, longitude)
-        SELECT geo_key, zip_code, city, county, state, latitude, longitude
-        FROM _geo_staging
-    """)
-    con.unregister("_geo_staging")
-    print(f"  Loaded {len(geo):,} geography dimension rows")
+    # ── ZIP ──────────────────────────────────────────────────────────────────
+    zip_col      = _find_col(cols, "zip")
+    df["zip_code"] = df[zip_col].apply(clean_zip) if zip_col else None
 
+    # ── Business name ─────────────────────────────────────────────────────────
+    name_col         = _find_col(cols, "businessname", "business_name", "name", exclude=("naics",))
+    df["business_name"] = df[name_col].astype(str).str.strip() if name_col else ""
 
-def load_dim_business(con: duckdb.DuckDBPyConnection, biz: pd.DataFrame) -> None:
-    con.register("_biz_staging", biz)
-    cols = ", ".join(biz.columns)
-    con.execute(f"INSERT OR IGNORE INTO dim_business ({cols}) SELECT {cols} FROM _biz_staging")
-    con.unregister("_biz_staging")
-    print(f"  Loaded {len(biz):,} business dimension rows")
+    # ── City & county ─────────────────────────────────────────────────────────
+    df["city"]   = df["city"].str.upper().str.strip()   if "city"   in cols else ""
+    county_col   = _find_col(cols, "county")
+    df["county"] = df[county_col].str.upper().str.strip() if county_col else ""
 
+    # ── NAICS ─────────────────────────────────────────────────────────────────
+    naics_col      = _find_col(cols, "naicscode", "naics_code", "naics", exclude=("desc",))
+    naics_desc_col = _find_col(cols, "naicsdescription", "naics_description", "naicsdesc")
+    df["naics_code"]        = df[naics_col].astype(str).str.strip()        if naics_col      else ""
+    df["naics_description"] = df[naics_desc_col].astype(str).str.strip()   if naics_desc_col else ""
+    df["strategic_category"] = df["naics_code"].apply(classify_naics)
 
-def compute_and_load_gaps(con: duckdb.DuckDBPyConnection) -> None:
-    """Derive market gap scores from business density vs WA average."""
-    con.execute("""
-        INSERT OR REPLACE INTO fact_market_gaps
-        SELECT
-            ROW_NUMBER() OVER ()                        AS gap_key,
-            geo_key,
-            industry_key,
-            CURRENT_DATE                                AS snapshot_date,
-            AVG(density_per_10k) OVER (
-                PARTITION BY industry_key
-            )                                           AS wa_avg_density,
-            density_per_10k                             AS local_density,
-            AVG(density_per_10k) OVER (
-                PARTITION BY industry_key
-            ) - density_per_10k                         AS gap_score,
-            CASE
-                WHEN AVG(density_per_10k) OVER (PARTITION BY industry_key)
-                     - density_per_10k > 5  THEN 'High'
-                WHEN AVG(density_per_10k) OVER (PARTITION BY industry_key)
-                     - density_per_10k > 2  THEN 'Medium'
-                ELSE 'Low'
-            END                                         AS opportunity_tier
-        FROM fact_business_density
-    """)
-    print("  Market gap scores computed and loaded")
+    # ── Open date & status ────────────────────────────────────────────────────
+    date_col    = _find_col(cols, "opendate", "open_date", "licensestart", "startdate")
+    df["open_date"] = pd.to_datetime(df[date_col], errors="coerce") if date_col else pd.NaT
+
+    status_col  = _find_col(cols, "status")
+    df["status"] = df[status_col].str.upper().str.strip() if status_col else "UNKNOWN"
+
+    # ── Drop rows missing essential fields ────────────────────────────────────
+    before = len(df)
+    df = df.dropna(subset=["ubi", "latitude", "longitude", "zip_code"])
+    log.info("Dropped %d rows missing UBI / coordinates / zip  (%d remain)", before - len(df), len(df))
+
+    keep = ["ubi", "business_name", "city", "zip_code", "county",
+            "latitude", "longitude", "naics_code", "naics_description",
+            "strategic_category", "open_date", "status"]
+    return df[[c for c in keep if c in df.columns]].reset_index(drop=True)
 
 
-# ---------- Orchestrate ----------
-
-def run():
-    raw = extract_businesses()
-    geo = transform_geography(raw)
-    biz = transform_businesses(raw)
-
-    con = get_connection()
-    load_dim_industry(con)
-    load_dim_geography(con, geo)
-    load_dim_business(con, biz)
-    compute_and_load_gaps(con)
-    con.close()
-    print("ETL pipeline complete.")
+def run() -> None:
+    raw     = fetch_businesses()
+    staging = transform(raw)
+    staging.to_parquet(OUTPUT_PATH, compression="snappy", index=False)
+    log.info("Saved %d records → %s", len(staging), OUTPUT_PATH)
+    log.info("Strategic category breakdown:\n%s",
+             staging["strategic_category"].value_counts().to_string())
 
 
 if __name__ == "__main__":
